@@ -1,4 +1,4 @@
-# XDMINICLAW · 小小豆 QQ AI 助手
+# XDMINICLAW ·  QQ AI 助手
 
 > 基于 **Spring AI Alibaba** + **通义千问** 构建的全功能 QQ 机器人，集成 ReAct Agent、长期记忆、RAG 知识库、Skill 扩展体系等能力。
 
