@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "xmind": {
+      "source": "mitscherlich/skills",
+      "sourceType": "github",
+      "computedHash": "627822b1bfbad094ada036a93a996066d36dfbf4476072dc7bccff7b9c700a4e"
+    }
+  }
+}

@@ -1,0 +1,120 @@
+## === 应用名称配置 ===
+#spring:
+#  application:
+#    name: XDMINICLAW
+#  datasource:
+#    url: jdbc:postgresql://localhost:5432/xd_claw
+#    jdbc-url: jdbc:postgresql://localhost:5432/xd_claw
+#    username: myuser
+#    password: 12345678
+#    driver-class-name: org.postgresql.Driver
+#
+#  # === Web 配置（纯 Bot 不启动服务器）===
+#  main:
+#    web-application-type: none
+#
+#  # === AI 核心配置（注意缩进，必须在 spring 下级）===
+#  ai:
+#    dashscope:
+#      # 填入你的 Key
+#      api-key: sk-**********************
+#
+#      # === 聊天模型配置（关键！这里必须有 model）===
+#      chat:
+#        options:
+#          # 这里必须指定模型名称，不能缺省
+#          model: qwen-plus
+#          # 温度参数
+#          temperature: 0.7
+#
+#    # === pgVector 向量存储配置 ===
+#    vectorstore:
+#      pgvector:
+#        initialize-schema: true
+#        index-type: HNSW
+#        distance-type: COSINE_DISTANCE
+#        dimensions: 1024
+#        table-name: long_term_memory
+#
+## === 自定义 QQ 机器人配置（注意：这里顶格写，不要缩进！）===
+#xdclaw:
+#  qq:
+#    # 替换为你的 QQ 开放平台 AppId
+#    app-id: **********
+#
+#    # 替换为你的 QQ 开放平台 ClientSecret
+#    client-secret: **************
+#
+#    # access-token: ${QQ_ACCESS_TOKEN:} # 备用配置，二选一
+#    intents: 33558528 # (1<<25)|(1<<12) 单聊+频道私信
+#
+#  ai:
+#    # skills 目录（搜索和安装共用同一路径）
+#    skills-dir: .agents/skills
+#    system-prompt: |
+#      你是****，运行在QQ上的智能助手，由**开发。
+#
+#      ## 核心能力
+#      - **对话与记忆**：多轮对话，自动维持会话上下文
+#      - **长期记忆**：用 `searchMemory` 检索历史记忆；当用户问"你还记得…"时主动调用
+#      - **知识库**：用 `searchKnowledgeBase` 查询本地文档；用户问功能说明、使用方法时优先调用
+#      - **文件收发**：可接收用户发来的图片/文件（自动保存至 ./tem/received/）；用 `listTempFiles` 查看本地文件，用 `sendTempFile` / `sendAllTempFiles` 发送给用户
+#
+#      ## 可用工具
+#      | 工具 | 用途 |
+#      |------|------|
+#      | getWeather | 查询城市实时天气 |
+#      | getDateTime | 查询当前时间日期 |
+#      | calculate | 数学计算 |
+#      | searchImages | 图片搜索 |
+#      | webSearch | 网络搜索 |
+#      | webScraping | 网页内容抓取 |
+#      | generatePDF | 生成 PDF 文件 |
+#      | downloadResource | 下载网络资源 |
+#      | executeTerminal | 执行终端命令 |
+#      | sendFileToQQUser | 发送本地文件给当前用户 |
+#      | listTempFiles / sendTempFile / sendAllTempFiles | tem 目录文件管理与发送 |
+#      | searchMemory | 检索长期记忆（pgVector） |
+#      | searchKnowledgeBase | 检索本地知识库 |
+#      | searchSkills / installSkill | 从市场搜索并安装新 skill |
+#
+#      ## 已安装 Skills（.agents/skills/）
+#      `pdf` `docx` `xlsx` `pptx` `mcp-builder` `skill-creator`
+#      使用前调用 `read_skill <name>` 获取完整指令，严格按指令执行。
+#      **所有 skill 生成的文件必须保存到 `./tem/` 目录**，不得在项目根目录下创建新文件夹。
+#
+#      ## 行为准则
+#      - 回复简洁，避免冗长
+#      - 有工具可用时优先调用工具，不猜测
+#      - 生成的文件统一保存到 ./tem/ 目录，生成后主动发送给用户
+#    timeout-seconds: 30
+#    # 记忆文件存储路径
+#    memory-dir: ./data/memory
+#    # 滑动窗口：保留最近 N 轮对话
+#    memory-window-turns: 5
+#    # 摘要压缩触发阈值（轮数）
+#    memory-compress-trigger-turns: 20
+#    # 每次压缩批次大小（轮数）
+#    memory-compress-batch-turns: 15
+#    # 摘要压缩使用的轻量模型
+#    summary-model: qwen-turbo
+#    # === 长期记忆（pgVector）配置 ===
+#    # 是否启用长期记忆，false=完全跳过，不影响正常对话
+#    long-term-memory-enabled: true
+#    # 记忆注入间隔（秒），同一用户超过该间隔才重新查向量库
+#    long-term-memory-inject-interval-seconds: 300
+#    # 向量检索 Top-K
+#    long-term-memory-top-k: 5
+#
+## === 日志配置（顶格写）===
+#logging:
+#  level:
+#    com.xd.xdminiclaw: DEBUG
+#    org.springframework.ai: INFO
+#    com.alibaba.cloud.ai: INFO
+#
+#search-api:
+#  api-key: *****************
+#
+#amap:
+#  api-key: ************************
