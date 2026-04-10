@@ -6,6 +6,7 @@ import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
@@ -17,9 +18,10 @@ import java.util.stream.Collectors;
  * 图片搜索工具类
  */
 @Component
-public class ImageSearchTool {
+public class ImageSearchTool implements AgentTool {
 
-    private static final String API_KEY = "M7kHIFFyx8tWZEDfmOAUURUFhf2mWphIYWkpv2v2RKj3ubdzyZCf2hW5";
+    @Value("${pexels.api-key:}")
+    private String apiKey;
 
     private static final String API_URL = "https://api.pexels.com/v1/search";
 
@@ -32,25 +34,20 @@ public class ImageSearchTool {
         }
     }
 
-    
     public List<String> searchMediumImages(String query) {
-        
         Map<String, String> headers = new HashMap<>();
-        headers.put("Authorization", API_KEY);
+        headers.put("Authorization", apiKey);
 
-        
         Map<String, Object> params = new HashMap<>();
         params.put("query", query);
 
-        
         String response = HttpUtil.createGet(API_URL)
                 .addHeaders(headers)
                 .form(params)
-                .timeout(5000)  // 5秒超时
+                .timeout(5000)
                 .execute()
                 .body();
 
-        
         return JSONUtil.parseObj(response)
                 .getJSONArray("photos")
                 .stream()

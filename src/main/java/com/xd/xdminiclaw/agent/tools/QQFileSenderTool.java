@@ -18,7 +18,7 @@ import org.springframework.stereotype.Component;
  */
 @Slf4j
 @Component
-public class QQFileSenderTool {
+public class QQFileSenderTool implements AgentTool {
 
     private final QQBotClient qqBotClient;
 

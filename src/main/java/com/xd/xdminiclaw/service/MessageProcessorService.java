@@ -1,30 +1,30 @@
 package com.xd.xdminiclaw.service;
 
 import com.xd.xdminiclaw.bot.InboundMessage;
+import com.xd.xdminiclaw.bot.QQBotClient;
 import com.xd.xdminiclaw.bot.UserContextHolder;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.util.Collections;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 /**
  * 核心业务层：协调消息处理流程
- * - 消息去重
- * - 指令识别（/help、/status 等）
- * - 构建会话 threadId（senderId 标识用户）
- * - 调用 AI 服务（携带 threadId 保持记忆）
- * - 异步回调发送响应
+ * - 用量限制（每用户每日最多 N 次）
+ * - URL 自动识别（链接消息自动触发总结）
+ * - 消息去重（LRU，容量 1000）
+ * - 指令路由
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class MessageProcessorService {
 
     private static final String HELP_TEXT = """
@@ -33,29 +33,65 @@ public class MessageProcessorService {
 
             支持的功能：
             • 直接发送文字 → AI回复（含会话记忆）
+            • 发送图片/文件 → 自动保存并分析
+            • 发送链接 → 自动抓取并总结内容
             • /help 或 帮助 → 查看此帮助
             • /status 或 状态 → 查看系统状态
+            • /quota 或 用量 → 查看今日剩余次数
             • /clear 或 清除记忆 → 清除本人的对话历史
-            • /forget 或 清除长期记忆 → 清除长期记忆（喜好、角色、性格等）
+            • /forget 或 清除长期记忆 → 清除长期记忆
             """;
 
-    private final AiService aiService;
+    /** URL 检测正则（http/https 链接） */
+    private static final Pattern URL_PATTERN =
+            Pattern.compile("https?://[\\w\\-._~:/?#\\[\\]@!$&'()*+,;=%]+");
 
-    /** 消息去重（最多保留最近 10000 条） */
-    private final Set<String> processedIds = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private static final int DEDUP_CAPACITY = 1000;
+
+    private final AiService    aiService;
+    private final UsageLimiter usageLimiter;
+    private final QQBotClient  qqBotClient;
+
+    /** LRU 去重 Set，自动淘汰最旧条目 */
+    private final Map<String, Boolean> processedIds = Collections.synchronizedMap(
+            new LinkedHashMap<>(DEDUP_CAPACITY, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Boolean> e) {
+                    return size() > DEDUP_CAPACITY;
+                }
+            });
+
+    public MessageProcessorService(AiService aiService,
+                                   UsageLimiter usageLimiter,
+                                   @Lazy QQBotClient qqBotClient) {
+        this.aiService    = aiService;
+        this.usageLimiter = usageLimiter;
+        this.qqBotClient  = qqBotClient;
+    }
 
     @Async
-    public CompletableFuture<Void> processAsync(InboundMessage message, Consumer<String> responseCallback) {
-        // 用 senderId + 消息内容 + 时间秒级 作为去重键
+    public CompletableFuture<Void> processAsync(InboundMessage message,
+                                                Consumer<String> responseCallback) {
+        // 去重
         String dedupKey = message.getSenderId() + ":" + message.getContent()
-                + ":" + (message.getTimestamp().toEpochSecond());
-        if (!processedIds.add(dedupKey)) {
+                + ":" + message.getTimestamp().toEpochSecond();
+        if (processedIds.putIfAbsent(dedupKey, Boolean.TRUE) != null) {
             log.debug("重复消息已忽略: {}", dedupKey);
             return CompletableFuture.completedFuture(null);
         }
-        if (processedIds.size() > 10000) processedIds.clear();
 
         log.info("处理消息 from {}: {}", message.getSenderId(), message.getContent());
+
+        // 用量检查（指令不消耗配额）
+        String text = message.getContent() != null ? message.getContent().trim() : "";
+        boolean isCommand = text.startsWith("/") || isCommand(text, "帮助", "help", "状态", "status",
+                "用量", "清除记忆", "清除长期记忆");
+
+        if (!isCommand && !usageLimiter.checkAndConsume(message.getSenderId())) {
+            responseCallback.accept("今日对话次数已达上限，明天再来吧~ 💤");
+            return CompletableFuture.completedFuture(null);
+        }
+
         responseCallback.accept(process(message));
         return CompletableFuture.completedFuture(null);
     }
@@ -63,24 +99,30 @@ public class MessageProcessorService {
     private String process(InboundMessage message) {
         String text = message.getContent() != null ? message.getContent().trim() : "";
 
-        if (isCommand(text, "/help", "帮助", "help")) return HELP_TEXT;
+        // 指令路由
+        if (isCommand(text, "/help", "帮助", "help"))    return HELP_TEXT;
         if (isCommand(text, "/status", "状态", "status")) return buildStatusText();
+        if (isCommand(text, "/quota", "用量")) {
+            int remaining = usageLimiter.getRemaining(message.getSenderId());
+            return "今日剩余对话次数：" + (remaining == Integer.MAX_VALUE ? "无限制（管理员）" : remaining + " 次");
+        }
         if (isCommand(text, "/clear", "清除记忆")) {
-            String threadId = "qq_" + message.getSenderId();
-            return aiService.clearMemory(threadId);
+            return aiService.clearMemory("qq_" + message.getSenderId());
         }
         if (isCommand(text, "/forget", "清除长期记忆")) {
-            String threadId = "qq_" + message.getSenderId();
-            return aiService.clearLongTermMemory(threadId);
+            return aiService.clearLongTermMemory("qq_" + message.getSenderId());
         }
 
         if (!StringUtils.hasText(text)) {
             return "你好！有什么我可以帮你的吗？发送「帮助」查看功能介绍。";
         }
 
-        // threadId 使用 senderId，同一用户跨会话共享记忆
+        // URL 自动总结：纯链接消息自动触发总结
+        if (URL_PATTERN.matcher(text).matches() && text.split("\\s+").length == 1) {
+            text = "帮我总结这个链接的主要内容：" + text;
+        }
+
         String threadId = "qq_" + message.getSenderId();
-        // 设置线程级用户上下文，供 QQFileSenderTool 使用
         UserContextHolder.set(new UserContextHolder.UserContext(
                 message.getSenderId(),
                 (String) message.getMetadata().get("qq_msg_id")
@@ -100,11 +142,11 @@ public class MessageProcessorService {
     }
 
     private String buildStatusText() {
-        return """
-                === XdClaw 系统状态 ===
-                AI服务：在线 ✓
-                QQ连接：在线
-                运行时间：正常
-                """;
+        boolean connected = qqBotClient.isConnected();
+        String  tokenInfo = qqBotClient.getTokenStatus();
+        return "=== XdClaw 系统状态 ===\n"
+                + "AI服务：在线 ✓\n"
+                + "QQ连接：" + (connected ? "在线 ✓" : "断线 ✗") + "\n"
+                + "Token：" + tokenInfo + "\n";
     }
 }

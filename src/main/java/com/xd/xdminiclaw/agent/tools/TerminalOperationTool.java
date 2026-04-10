@@ -5,33 +5,48 @@ import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedReader;
-import java.io.IOException;
 import java.io.InputStreamReader;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 终端操作工具
  */
 @Component
-public class TerminalOperationTool {
+public class TerminalOperationTool implements AgentTool {
 
-    @Tool(description = "Execute a command in the terminal")
+    private static final int TIMEOUT_SECONDS = 30;
+
+    @Tool(description = "Execute a shell command in the terminal")
     public String executeTerminalCommand(@ToolParam(description = "Command to execute in the terminal") String command) {
         StringBuilder output = new StringBuilder();
         try {
-            Process process = Runtime.getRuntime().exec(command);
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            Process process = Runtime.getRuntime().exec(new String[]{"/bin/sh", "-c", command});
+            try (BufferedReader stdOut = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                 BufferedReader stdErr = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
                 String line;
-                while ((line = reader.readLine()) != null) {
+                while ((line = stdOut.readLine()) != null) {
                     output.append(line).append("\n");
                 }
+                StringBuilder errOutput = new StringBuilder();
+                while ((line = stdErr.readLine()) != null) {
+                    errOutput.append(line).append("\n");
+                }
+                if (!errOutput.isEmpty()) {
+                    output.append("[stderr] ").append(errOutput);
+                }
             }
-            int exitCode = process.waitFor();
-            if (exitCode != 0) {
-                output.append("Command execution failed with exit code: ").append(exitCode);
+            boolean finished = process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                return "Command timed out after " + TIMEOUT_SECONDS + " seconds.";
             }
-        } catch (IOException | InterruptedException e) {
+            int exitCode = process.exitValue();
+            if (exitCode != 0 && output.isEmpty()) {
+                output.append("Command exited with code: ").append(exitCode);
+            }
+        } catch (Exception e) {
             output.append("Error executing command: ").append(e.getMessage());
         }
-        return output.toString();
+        return output.isEmpty() ? "Command executed with no output." : output.toString().trim();
     }
 }

@@ -22,7 +22,7 @@ import java.nio.file.*;
  */
 @Slf4j
 @Component
-public class SkillManagementTool {
+public class SkillManagementTool implements AgentTool {
 
     @Value("${xdclaw.ai.skills-dir:.agents/skills}")
     private String skillsDir;

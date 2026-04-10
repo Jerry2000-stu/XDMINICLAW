@@ -17,7 +17,7 @@ import java.util.Map;
  */
 @Slf4j
 @Component
-public class WeatherTool {
+public class WeatherTool implements AgentTool {
 
     private static final String WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo";
 

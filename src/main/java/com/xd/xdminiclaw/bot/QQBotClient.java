@@ -13,7 +13,9 @@ import okhttp3.*;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -71,7 +73,18 @@ public class QQBotClient {
     private final AtomicReference<String> sessionId = new AtomicReference<>();
     private volatile ScheduledFuture<?> heartbeatTask;
     private volatile boolean needIdentify = true;
-    private volatile String cachedToken;
+    private volatile String  cachedToken;
+    private volatile long    tokenExpiresAt = 0;
+    private static final long TOKEN_REFRESH_BEFORE_MS = 5 * 60 * 1000;
+
+    /** 每条原始消息（msg_id）的回复序号，用于支持同一消息的多次被动回复（打字机提示）*/
+    private final Map<String, java.util.concurrent.atomic.AtomicInteger> msgSeqMap =
+            Collections.synchronizedMap(new LinkedHashMap<>(500, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, java.util.concurrent.atomic.AtomicInteger> e) {
+                    return size() > 500;
+                }
+            });
 
     public QQBotClient(XdClawProperties properties, MessageProcessorService messageProcessor) {
         this.properties = properties;
@@ -81,6 +94,10 @@ public class QQBotClient {
     @PostConstruct
     public void start() {
         running.set(true);
+        // 每 30 分钟检查一次 token 是否临近到期，主动刷新
+        scheduler.scheduleAtFixedRate(this::refreshTokenIfNeeded, 30, 30, TimeUnit.MINUTES);
+        // 每 6 小时清理一次过期附件
+        scheduler.scheduleAtFixedRate(this::cleanupOldAttachments, 6, 6, TimeUnit.HOURS);
         connect();
     }
 
@@ -131,15 +148,38 @@ public class QQBotClient {
                 }
                 JsonNode node = mapper.readTree(resp.body().string());
                 if (node.has("access_token")) {
-                    return node.get("access_token").asText();
+                    String token = node.get("access_token").asText();
+                    // expires_in 字段（秒），默认 7200s
+                    long expiresIn = node.has("expires_in") ? node.get("expires_in").asLong(7200) : 7200;
+                    tokenExpiresAt = System.currentTimeMillis() + expiresIn * 1000;
+                    log.info("[QQBot] Token 已刷新，有效期 {}s", expiresIn);
+                    return token;
                 }
                 throw new IOException("getAppAccessToken 响应中缺少 access_token");
             }
         }
         if (hasText(qq.getAccessToken())) {
+            tokenExpiresAt = Long.MAX_VALUE; // 静态 token 不设过期
             return qq.getAccessToken();
         }
         throw new IllegalStateException("QQ 配置缺少 appId+clientSecret 或 access-token");
+    }
+
+    /** 主动检查 token 是否临近到期，若是则刷新并重新建立 WebSocket 连接 */
+    private void refreshTokenIfNeeded() {
+        if (!running.get()) return;
+        if (System.currentTimeMillis() < tokenExpiresAt - TOKEN_REFRESH_BEFORE_MS) return;
+        log.info("[QQBot] Token 临近到期，主动刷新...");
+        try {
+            cachedToken = getAccessToken();
+            // 重连以使用新 token 完成 Identify
+            needIdentify = true;
+            WebSocket ws = wsRef.getAndSet(null);
+            if (ws != null) ws.close(1000, "token refresh");
+            connect();
+        } catch (Exception e) {
+            log.error("[QQBot] Token 主动刷新失败: {}", e.getMessage());
+        }
     }
 
     private String fetchGatewayUrl(String token) throws IOException {
@@ -233,7 +273,13 @@ public class QQBotClient {
         body.put("content", msg.getContent());
         body.put("msg_type", 0);
         Object msgId = msg.getMetadata().get("qq_msg_id");
-        if (msgId != null) body.put("msg_id", msgId.toString());
+        if (msgId != null) {
+            body.put("msg_id", msgId.toString());
+            // 同一 msg_id 的回复序号自动递增，支持打字机提示（思考中... + 正文）
+            int seq = msgSeqMap.computeIfAbsent(msgId.toString(),
+                    k -> new java.util.concurrent.atomic.AtomicInteger(0)).incrementAndGet();
+            body.put("msg_seq", seq);
+        }
 
         String url = "https://api.sgroup.qq.com/v2/users/" + msg.getChatId() + "/messages";
         try {
@@ -247,7 +293,10 @@ public class QQBotClient {
                 if (!resp.isSuccessful()) {
                     String err = resp.body() != null ? resp.body().string() : "";
                     log.error("[QQBot] 发送消息失败 {}: {}", resp.code(), err);
-                    if (resp.code() == 401) cachedToken = null;
+                    if (resp.code() == 401) {
+                        cachedToken = null;
+                        tokenExpiresAt = 0;
+                    }
                 }
             }
         } catch (Exception e) {
@@ -294,7 +343,10 @@ public class QQBotClient {
                 if (!resp.isSuccessful()) {
                     String err = resp.body() != null ? resp.body().string() : "";
                     log.error("[QQBot] 发送媒体消息失败 {}: {}", resp.code(), err);
-                    if (resp.code() == 401) cachedToken = null;
+                    if (resp.code() == 401) {
+                        cachedToken = null;
+                        tokenExpiresAt = 0;
+                    }
                     return "发送失败：" + resp.code() + " " + err;
                 }
                 log.info("[QQBot] 媒体消息已发送给 openId={}", openId);
@@ -506,8 +558,10 @@ public class QQBotClient {
 
     /**
      * 下载 QQ 附件到 ./tem/received/ 目录，返回本地绝对路径；失败返回 null。
+     * 每次下载前异步清理超过 24 小时的旧文件。
      */
     private String downloadAttachment(String url, String filename) {
+        Thread.ofVirtual().start(this::cleanupOldAttachments);
         try {
             java.nio.file.Path dir = java.nio.file.Path.of(
                     System.getProperty("user.dir"), "tem", "received");
@@ -545,4 +599,45 @@ public class QQBotClient {
     }
 
     public boolean isConnected() { return wsRef.get() != null; }
+
+    /** 返回 token 剩余有效时间的可读描述，供 /status 使用 */
+    public String getTokenStatus() {
+        if (cachedToken == null) return "未获取";
+        if (tokenExpiresAt == Long.MAX_VALUE) return "静态Token（长期有效）";
+        long remaining = tokenExpiresAt - System.currentTimeMillis();
+        if (remaining <= 0) return "已过期";
+        long minutes = remaining / 60000;
+        if (minutes >= 60) return "有效（剩余约 " + minutes / 60 + " 小时 " + minutes % 60 + " 分）";
+        return "有效（剩余约 " + minutes + " 分钟）";
+    }
+
+    /**
+     * 清理 ./tem/received/ 中超过 24 小时的文件，避免磁盘无限增长
+     */
+    private void cleanupOldAttachments() {
+        try {
+            java.nio.file.Path receivedDir = java.nio.file.Path.of(
+                    System.getProperty("user.dir"), "tem", "received");
+            if (!java.nio.file.Files.exists(receivedDir)) return;
+            long cutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1000L;
+            try (var stream = java.nio.file.Files.list(receivedDir)) {
+                stream.filter(p -> {
+                    try {
+                        return java.nio.file.Files.getLastModifiedTime(p).toMillis() < cutoff;
+                    } catch (Exception e) {
+                        return false;
+                    }
+                }).forEach(p -> {
+                    try {
+                        java.nio.file.Files.delete(p);
+                        log.debug("[QQBot] 已清理过期附件: {}", p.getFileName());
+                    } catch (Exception e) {
+                        log.warn("[QQBot] 清理附件失败: {}", p);
+                    }
+                });
+            }
+        } catch (Exception e) {
+            log.warn("[QQBot] 清理 received 目录异常: {}", e.getMessage());
+        }
+    }
 }

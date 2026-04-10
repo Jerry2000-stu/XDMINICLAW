@@ -26,7 +26,7 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Component
-public class VectorSearchTool {
+public class VectorSearchTool implements AgentTool {
 
     private final LongTermMemoryService longTermMemoryService;
     private final RagIndexingService ragIndexingService;

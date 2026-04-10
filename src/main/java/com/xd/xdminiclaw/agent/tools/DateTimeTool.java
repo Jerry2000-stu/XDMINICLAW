@@ -10,7 +10,7 @@ import java.time.format.DateTimeFormatter;
  * ReAct Agent 工具：日期时间查询
  */
 @Component
-public class DateTimeTool {
+public class DateTimeTool implements AgentTool {
 
     private static final DateTimeFormatter FORMATTER =
             DateTimeFormatter.ofPattern("yyyy年MM月dd日 HH:mm:ss");

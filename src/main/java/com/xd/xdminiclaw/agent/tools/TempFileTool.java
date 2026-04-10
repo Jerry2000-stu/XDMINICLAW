@@ -20,7 +20,7 @@ import java.util.List;
  */
 @Slf4j
 @Component
-public class TempFileTool {
+public class TempFileTool implements AgentTool {
 
     private static final String TEM_DIR = System.getProperty("user.dir") + "/tem";
 

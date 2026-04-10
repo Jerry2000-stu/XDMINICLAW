@@ -15,7 +15,7 @@ import org.springframework.stereotype.Component;
  * PDF生成工具
  */
 @Component
-public class PDFGenerationTool {
+public class PDFGenerationTool implements AgentTool {
 
     @Tool(description = "Generate a PDF file with given content")
     public String generatePDF(

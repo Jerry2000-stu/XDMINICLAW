@@ -22,10 +22,11 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * AI服务层：
  * - 纯文本对话 → ReactAgent（ReAct 循环 + 会话记忆）
- * - 图文对话   → 直接 ChatClient（VL 模型，不走 ReAct 循环）
+ * - 图文对话   → ChatClient（VL 模型），图片分析后结果也记入会话
  *
  * 长期记忆策略（pgVector，可通过配置开关）：
  *   - 时间窗口注入：同一用户超过 inject-interval 才重新从向量库拉取记忆，避免每轮查库
+ *   - 注入方式：拼在 systemPrompt 前缀，不污染 userText 和 Kryo checkpoint
  *   - 异步提炼：主线程返回回复后，后台异步提炼本轮重要信息写入向量库
  */
 @Slf4j
@@ -35,6 +36,7 @@ public class AiService {
     private final ReactAgentService reactAgentService;
     private final ChatClient visionChatClient;
     private final XdClawProperties.AiConfig aiCfg;
+    private final String baseSystemPrompt;
 
     private final LongTermMemoryService longTermMemoryService;
     private final MemoryExtractorService memoryExtractorService;
@@ -49,11 +51,11 @@ public class AiService {
             @Autowired(required = false) LongTermMemoryService longTermMemoryService) {
         this.reactAgentService     = reactAgentService;
         this.aiCfg                 = properties.getAi();
+        this.baseSystemPrompt      = aiCfg.getSystemPrompt();
         this.longTermMemoryService = longTermMemoryService;
         this.visionChatClient = ChatClient.builder(chatModel)
-                .defaultSystem(aiCfg.getSystemPrompt())
+                .defaultSystem(baseSystemPrompt)
                 .build();
-        // MemoryExtractorService 手动 new，确保注入 summaryModel 指定轻量模型
         this.memoryExtractorService = (aiCfg.isLongTermMemoryEnabled() && longTermMemoryService != null)
                 ? new MemoryExtractorService(chatModel, aiCfg.getSummaryModel(), longTermMemoryService)
                 : null;
@@ -61,18 +63,17 @@ public class AiService {
 
     /**
      * 纯文本对话，走 ReAct Agent，携带 threadId 保持会话记忆。
-     * 若长期记忆已启用，在符合时间间隔时将召回记忆拼入前缀，并在回复后异步提炼。
+     * 若长期记忆已启用，在符合时间间隔时将召回记忆注入 system prompt 前缀（不修改 userText）。
      */
     public String chat(String userText, String threadId) {
-        String inputText = buildInputWithMemory(userText, threadId);
-        String reply = reactAgentService.chat(inputText, threadId);
+        String systemPrefix = buildMemorySystemPrefix(threadId, userText);
+        String reply = reactAgentService.chat(userText, threadId, systemPrefix);
         triggerExtract(threadId, userText, reply);
         return reply;
     }
 
     /**
      * 清除指定用户的会话记忆（内存缓存 + 磁盘文件）。
-     * 同时清除长期记忆注入时间戳缓存，强制下次重新注入。
      */
     public String clearMemory(String threadId) {
         lastInjectTime.remove(threadId);
@@ -92,7 +93,7 @@ public class AiService {
     }
 
     /**
-     * 多模态图文对话，走 ChatClient（不经过 ReAct 循环）
+     * 多模态图文对话：先用 VL 模型分析图片，再把分析结果作为上下文走 ReAct 记忆通道。
      */
     public String chatWithImages(String userText, List<String> imageUrls, String threadId) {
         if (imageUrls == null || imageUrls.isEmpty()) {
@@ -102,14 +103,14 @@ public class AiService {
         String text = StringUtils.hasText(userText) ? userText : "请描述这张图片的内容。";
 
         try {
-            log.debug("发送图文请求到AI, thread={}, 文本: {}, 图片数: {}", threadId, text, imageUrls.size());
+            log.debug("[VL] thread={} 文本: {}, 图片数: {}", threadId, text, imageUrls.size());
 
             List<Media> mediaList = new ArrayList<>();
             for (String url : imageUrls) {
                 try {
                     mediaList.add(new Media(MimeType.valueOf("image/*"), new UrlResource(url)));
                 } catch (Exception e) {
-                    log.warn("无效的图片URL，已跳过: {}", url);
+                    log.warn("[VL] 无效的图片URL，已跳过: {}", url);
                 }
             }
 
@@ -117,14 +118,23 @@ public class AiService {
                 return chat(text, threadId);
             }
 
-            String response = visionChatClient.prompt()
+            // VL 模型分析图片内容
+            String imageDescription = visionChatClient.prompt()
                     .user(u -> u.text(text).media(mediaList.toArray(new Media[0])))
                     .call()
                     .content();
-            log.debug("AI图文回复: {}", response);
-            return response;
+
+            log.debug("[VL] 图片分析结果: {}", imageDescription);
+
+            // 把图片分析结果写入 ReAct 会话历史，保持记忆连续性
+            String contextualInput = "[用户发送了图片，图片内容如下]\n" + imageDescription
+                    + (StringUtils.hasText(userText) ? "\n\n用户问：" + userText : "");
+            String reply = reactAgentService.chat(contextualInput, threadId, null);
+            triggerExtract(threadId, contextualInput, reply);
+            return reply;
+
         } catch (Exception e) {
-            log.error("AI图文对话异常", e);
+            log.error("[VL] 图文对话异常", e);
             return "图片分析遇到问题，请稍后再试~";
         }
     }
@@ -134,11 +144,12 @@ public class AiService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * 若长期记忆已启用且距上次注入超过配置间隔，召回相关记忆并拼接到用户输入前缀。
+     * 构建携带长期记忆的 system prompt 前缀。
+     * 返回 null 表示无需注入（长期记忆未启用或未到注入间隔）。
      */
-    private String buildInputWithMemory(String userText, String threadId) {
+    private String buildMemorySystemPrefix(String threadId, String userText) {
         if (!aiCfg.isLongTermMemoryEnabled() || longTermMemoryService == null) {
-            return userText;
+            return null;
         }
 
         long now      = System.currentTimeMillis();
@@ -146,37 +157,34 @@ public class AiService {
         long interval = (long) aiCfg.getLongTermMemoryInjectIntervalSeconds() * 1000;
 
         if (now - last < interval) {
-            return userText;
+            return null;
         }
 
         try {
             List<String> memories = longTermMemoryService.recall(
                     threadId, userText, aiCfg.getLongTermMemoryTopK());
 
-            if (memories.isEmpty()) {
-                lastInjectTime.put(threadId, now);
-                return userText;
-            }
+            lastInjectTime.put(threadId, now);
 
-            StringBuilder sb = new StringBuilder();
-            sb.append("[用户历史记忆]\n");
+            if (memories.isEmpty()) return null;
+
+            StringBuilder sb = new StringBuilder("[用户历史记忆]\n");
             for (String m : memories) {
                 sb.append("- ").append(m).append("\n");
             }
-            sb.append("\n[当前问题]\n").append(userText);
+            sb.append("\n");
 
-            lastInjectTime.put(threadId, now);
-            log.debug("[LTM] thread={} 注入 {} 条长期记忆", threadId, memories.size());
+            log.debug("[LTM] thread={} 注入 {} 条长期记忆到 system prompt", threadId, memories.size());
             return sb.toString();
 
         } catch (Exception e) {
             log.warn("[LTM] thread={} 记忆注入失败（已跳过）: {}", threadId, e.getMessage());
-            return userText;
+            return null;
         }
     }
 
     /**
-     * 在主线程回复完成后，用虚拟线程异步提炼记忆（仅启用时执行）。
+     * 在主线程回复完成后，用虚拟线程异步提炼记忆。
      */
     private void triggerExtract(String threadId, String userText, String reply) {
         if (!aiCfg.isLongTermMemoryEnabled() || memoryExtractorService == null) return;

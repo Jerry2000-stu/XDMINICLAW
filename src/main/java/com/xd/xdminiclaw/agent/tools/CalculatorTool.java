@@ -8,7 +8,7 @@ import org.springframework.stereotype.Component;
  * ReAct Agent 工具：数学计算器
  */
 @Component
-public class CalculatorTool {
+public class CalculatorTool implements AgentTool {
 
     @Tool(description = "执行基本数学计算，支持加减乘除和取模运算。当用户需要计算数学表达式时使用")
     public String calculate(
